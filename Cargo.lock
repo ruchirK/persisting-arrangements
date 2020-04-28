@@ -3,11 +3,6 @@
 [[package]]
 name = "abomonation"
 version = "0.7.3"
-source = "git+https://github.com/TimelyDataflow/abomonation#9294cd202f134b9d4b023c22f37f0e63baf9c857"
-
-[[package]]
-name = "abomonation"
-version = "0.7.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "56e72913c99b1f927aa7bd59a41518fdd9995f63ffc8760f211609e0241c4fb2"
 
@@ -33,7 +28,7 @@ name = "differential-dataflow"
 version = "0.11.0"
 source = "git+https://github.com/TimelyDataflow/differential-dataflow#1a977866897035ada8c55240a0c1ccf7a8d03b81"
 dependencies = [
- "abomonation 0.7.3 (registry+https://github.com/rust-lang/crates.io-index)",
+ "abomonation",
  "abomonation_derive",
  "fnv",
  "serde",
@@ -78,7 +73,7 @@ checksum = "99e85c08494b21a9054e7fe1374a732aeadaff3980b6990b94bfd3a70f690005"
 name = "persisting-arrangements"
 version = "0.1.0"
 dependencies = [
- "abomonation 0.7.3 (git+https://github.com/TimelyDataflow/abomonation)",
+ "abomonation",
  "differential-dataflow",
  "rand",
  "timely",
@@ -194,7 +189,7 @@ name = "timely"
 version = "0.11.1"
 source = "git+https://github.com/TimelyDataflow/timely-dataflow#516e1d1999cfc2d411ddc61f57c0d3d7c17ca495"
 dependencies = [
- "abomonation 0.7.3 (registry+https://github.com/rust-lang/crates.io-index)",
+ "abomonation",
  "abomonation_derive",
  "serde",
  "serde_derive",
@@ -213,7 +208,7 @@ name = "timely_communication"
 version = "0.11.1"
 source = "git+https://github.com/TimelyDataflow/timely-dataflow#516e1d1999cfc2d411ddc61f57c0d3d7c17ca495"
 dependencies = [
- "abomonation 0.7.3 (registry+https://github.com/rust-lang/crates.io-index)",
+ "abomonation",
  "abomonation_derive",
  "getopts",
  "serde",
