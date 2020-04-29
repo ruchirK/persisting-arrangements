@@ -16,6 +16,10 @@ use timely::dataflow::channels::pact::Pipeline;
 use timely::dataflow::operators::generic::operator::Operator;
 use timely::dataflow::operators::generic::source;
 use timely::dataflow::operators::Inspect;
+use timely::dataflow::operators::Capability;
+use crate::differential_dataflow::trace::BatchReader;
+use crate::differential_dataflow::trace::Cursor;
+use crate::differential_dataflow::AsCollection;
 
 //
 // Open questions
@@ -69,20 +73,20 @@ fn main() {
                 }
             });
             // Let's make a source to see if we can't read in this file
-            source(scope, "BatchScanner", |capability, info| {
+            source::<_,_,_,_>(scope, "BatchScanner", |capability, info| {
                 let activator = scope.activator_for(&info.address[..]);
 
-                let mut cap = Some(capability);
+                let mut cap: Option<Capability<i32>> = Some(capability);
                 move |output| {
                     let mut done = false;
                     if let Some(cap) = cap.as_mut() {
                         // get some data and send it.
-                        let file = std::fs::File::open("testing").expect("open stored batch file");
+                        let mut file = std::fs::File::open("testing").expect("open stored batch file");
                         let mut buf: Vec<u8> = Vec::new();
                         file.read_to_end(&mut buf).expect("read failed");
 
                         let batch = if let Some((batch, remaining)) =
-                            unsafe { decode::<OrdValBatch<_, _, _, _>>(&mut buf) }
+                            unsafe { decode::<OrdValBatch<i32, i32, i32, isize>>(&mut buf) }
                         {
                             assert!(remaining.len() == 0);
                             println!("decoded: {:?}", batch);
@@ -91,12 +95,25 @@ fn main() {
                             panic!("unable to decode batch");
                         };
 
-                        let time: i32 = cap.time().clone();
-                        output.session(&cap).give(batch);
+                        let mut cursor = batch.cursor();
+                         cursor.rewind_keys(&batch);
+                         cursor.rewind_vals(&batch);
 
+                         while cursor.key_valid(&batch) {
+                             let key = cursor.key(&batch).clone();
+			                while cursor.val_valid(&batch) {
+                                let val = cursor.val(&batch).clone();
+				                cursor.map_times(&batch, |ts, r| {
+                                    output.session(&cap).give((key, val, r.clone()));
+				                });
+				                cursor.step_val(&batch);
+			                }
+			                cursor.step_key(&batch);
+	                    }
+                         
                         // downgrade capability.
-                        cap.downgrade(&(time + 1));
-                        done = time > 20;
+                        cap.downgrade(&10);
+                        done = true;
                     }
 
                     if done {
@@ -106,7 +123,8 @@ fn main() {
                     }
                 }
             })
-            .inspect(|x| println!("{:?}", x));
+            .as_collection()
+            .inspect(|x| println!("rereading {:?}", x));
 
             // return the handle so other non-dataflow code can feed us data
             handle
