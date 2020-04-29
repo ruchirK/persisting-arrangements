@@ -1,25 +1,17 @@
-//extern crate abomonation;
-extern crate differential_dataflow;
-extern crate timely;
-
 use std::io::{Read, Write};
 
-use crate::differential_dataflow::input::Input;
-use crate::differential_dataflow::operators::arrange::{ArrangeByKey, ArrangeBySelf};
-use crate::differential_dataflow::operators::JoinCore;
-use crate::timely::scheduling::Scheduler;
-use abomonation::abomonated::Abomonated;
 use abomonation::{decode, encode};
-//use differential_dataflow::trace::implementations::ord::OrdValSpineAbom as DefaultValTrace;
+use differential_dataflow::input::Input;
+use differential_dataflow::operators::arrange::{ArrangeByKey, ArrangeBySelf};
+use differential_dataflow::operators::JoinCore;
 use differential_dataflow::trace::implementations::ord::OrdValBatch;
+use differential_dataflow::trace::{BatchReader, Cursor};
+use differential_dataflow::AsCollection;
 use timely::dataflow::channels::pact::Pipeline;
 use timely::dataflow::operators::generic::operator::Operator;
 use timely::dataflow::operators::generic::source;
-use timely::dataflow::operators::Inspect;
-use timely::dataflow::operators::Capability;
-use crate::differential_dataflow::trace::BatchReader;
-use crate::differential_dataflow::trace::Cursor;
-use crate::differential_dataflow::AsCollection;
+use timely::dataflow::operators::{Capability, Inspect};
+use timely::scheduling::Scheduler;
 
 //
 // Open questions
@@ -29,51 +21,49 @@ use crate::differential_dataflow::AsCollection;
 //  a. it seems like at least in this toy we could interleave a timely source with some control flow
 //  but its a scattered thought
 
-//use abomonation::{encode, decode};
-
 fn main() {
     // define a new timely dataflow computation.
     timely::execute_from_args(std::env::args(), move |worker| {
         // define a new computation.
         let mut input = worker.dataflow(|scope| {
-            // create a new collection from our input.
-            // Specifically: we get back a handle to throw stuff in and
-            // the actual data
             let (handle, manages) = scope.new_collection();
             manages.inspect(|x| println!("manages: {:?}", x));
             let reverse = manages.map(|(manager, employee)| (employee, manager));
+
+            // Let's store and bring back these collections because we have a good idea
+            // how they evolve
             let manages = manages.arrange_by_key();
             let reverse = reverse.arrange_by_key();
-
-            //let reverse = reverse.arrange_by_key();
 
             // if (m2, m1) and (m1, p), then output (m1, (m2, p))
             manages
                 .join_core(&reverse, |m2, m1, p| Some((*m2, *m1, *p)))
-                .inspect(|x| println!("{:?}", x));
+                .inspect(|x| println!("manages: {:?}", x));
 
-            //lets just print the stream of batches to stdout
-            manages.stream.sink(Pipeline, "BatchPrinter", |input| {
-                while let Some((time, data)) = input.next() {
+            // We'll use a sink to write down the stream of batches we
+            // get from the manages collection
+            manages.stream.sink(Pipeline, "BatchWriter", |input| {
+                while let Some((_time, data)) = input.next() {
                     for d in data.iter() {
-                        //let local = (**d).clone();
                         let mut bytes = Vec::new();
                         unsafe {
-                            encode(&(**d), &mut bytes);
+                            encode(&(**d), &mut bytes).expect("encoding batches failed");
                         }
-                        println!("{:?}", d);
-                        println!("{:?}", bytes);
+                        //println!("{:?}", d);
+                        //println!("{:?}", bytes);
 
                         // TODO in a more realistic scenario we would give this file a new name every time
                         let mut file = std::fs::File::create("testing-2")
-                            .expect("creating file to dump batches");
-                        file.write(&bytes);
-                        file.flush();
+                            .expect("creating file to write batches");
+                        file.write(&bytes).expect("writing batches should succeed");
+                        file.flush().expect("flushing batches should succeed");
                     }
                 }
             });
-            // Let's make a source to see if we can't read in this file
-            source::<_,_,_,_>(scope, "BatchScanner", |capability, info| {
+
+            // We'll use a source to read in a previously saved version of the
+            // manages collection if it exists
+            source::<_, _, _, _>(scope, "BatchReader", |capability, info| {
                 let activator = scope.activator_for(&info.address[..]);
 
                 let mut cap: Option<Capability<i32>> = Some(capability);
@@ -81,36 +71,43 @@ fn main() {
                     let mut done = false;
                     if let Some(cap) = cap.as_mut() {
                         // get some data and send it.
-                        let mut file = std::fs::File::open("testing").expect("open stored batch file");
+                        let mut file =
+                            std::fs::File::open("testing").expect("open stored batch file");
                         let mut buf: Vec<u8> = Vec::new();
                         file.read_to_end(&mut buf).expect("read failed");
 
+                        // TODO unclear how completely we need to specify types
+                        // for OrdValBatch here
                         let batch = if let Some((batch, remaining)) =
                             unsafe { decode::<OrdValBatch<i32, i32, i32, isize>>(&mut buf) }
                         {
                             assert!(remaining.len() == 0);
-                            println!("decoded: {:?}", batch);
+                            //println!("decoded: {:?}", batch);
                             batch
                         } else {
+                            // TODO In the future we'll need to be able to handle this
+                            // more gracefully
                             panic!("unable to decode batch");
                         };
 
+                        // Step through all the (key, val, time, diff) tuples in this batch
+                        // and send them to our computation
                         let mut cursor = batch.cursor();
-                         cursor.rewind_keys(&batch);
-                         cursor.rewind_vals(&batch);
+                        cursor.rewind_keys(&batch);
+                        cursor.rewind_vals(&batch);
 
-                         while cursor.key_valid(&batch) {
-                             let key = cursor.key(&batch).clone();
-			                while cursor.val_valid(&batch) {
+                        while cursor.key_valid(&batch) {
+                            let key = cursor.key(&batch).clone();
+                            while cursor.val_valid(&batch) {
                                 let val = cursor.val(&batch).clone();
-				                cursor.map_times(&batch, |ts, r| {
+                                cursor.map_times(&batch, |_ts, r| {
                                     output.session(&cap).give((key, val, r.clone()));
-				                });
-				                cursor.step_val(&batch);
-			                }
-			                cursor.step_key(&batch);
-	                    }
-                         
+                                });
+                                cursor.step_val(&batch);
+                            }
+                            cursor.step_key(&batch);
+                        }
+
                         // downgrade capability.
                         cap.downgrade(&10);
                         done = true;
