@@ -10,6 +10,7 @@ use differential_dataflow::AsCollection;
 use timely::dataflow::channels::pact::Pipeline;
 use timely::dataflow::operators::generic::operator::Operator;
 use timely::dataflow::operators::generic::source;
+use timely::dataflow::operators::probe::{Handle, Probe};
 use timely::dataflow::operators::{Capability, Inspect};
 use timely::scheduling::Scheduler;
 
@@ -24,6 +25,68 @@ use timely::scheduling::Scheduler;
 fn main() {
     // define a new timely dataflow computation.
     timely::execute_from_args(std::env::args(), move |worker| {
+        let mut probe = timely::dataflow::operators::probe::Handle::new();
+
+        let mut old_batch = worker.dataflow::<i32, _, _>(|scope| {
+            source::<_, _, _, _>(scope, "BatchReader", |mut capability, info| {
+                let activator = scope.activator_for(&info.address[..]);
+
+                move |output| {
+                    let mut time = capability.time().clone();
+                    {
+                        // get some data and send it.
+                        let mut file =
+                            std::fs::File::open("testing").expect("open stored batch file");
+                        let mut buf: Vec<u8> = Vec::new();
+                        file.read_to_end(&mut buf).expect("read failed");
+
+                        // TODO unclear how completely we need to specify types
+                        // for OrdValBatch here
+                        let batch = if let Some((batch, remaining)) =
+                            unsafe { decode::<OrdValBatch<i32, i32, i32, isize>>(&mut buf) }
+                        {
+                            assert!(remaining.len() == 0);
+                            //println!("decoded: {:?}", batch);
+                            batch
+                        } else {
+                            // TODO In the future we'll need to be able to handle this
+                            // more gracefully
+                            panic!("unable to decode batch");
+                        };
+
+                        let mut session = output.session(&capability);
+                        // Step through all the (key, val, time, diff) tuples in this batch
+                        // and send them to our computation
+                        let mut cursor = batch.cursor();
+                        cursor.rewind_keys(&batch);
+                        cursor.rewind_vals(&batch);
+
+                        while cursor.key_valid(&batch) {
+                            while cursor.val_valid(&batch) {
+                                cursor.map_times(&batch, |ts, r| {
+                                    session.give((
+                                        (cursor.key(&batch).clone(), cursor.val(&batch).clone()),
+                                        ts.clone(),
+                                        r.clone(),
+                                    ));
+                                });
+                                cursor.step_val(&batch);
+                            }
+                            cursor.step_key(&batch);
+                        }
+                    }
+                    // downgrade capability.
+                    capability.downgrade(&time);
+                    activator.activate();
+                }
+            })
+            .probe_with(&mut probe)
+            //.inspect(|x| println!("rereading {:?}", x))
+            .as_collection()
+            .arrange_by_key()
+            //.trace
+        });
+
         // define a new computation.
         let mut input = worker.dataflow(|scope| {
             let (handle, manages) = scope.new_collection();
@@ -63,65 +126,7 @@ fn main() {
 
             // We'll use a source to read in a previously saved version of the
             // manages collection if it exists
-            source::<_, _, _, _>(scope, "BatchReader", |capability, info| {
-                let activator = scope.activator_for(&info.address[..]);
-
-                let mut cap: Option<Capability<i32>> = Some(capability);
-                move |output| {
-                    let mut done = false;
-                    if let Some(cap) = cap.as_mut() {
-                        // get some data and send it.
-                        let mut file =
-                            std::fs::File::open("testing").expect("open stored batch file");
-                        let mut buf: Vec<u8> = Vec::new();
-                        file.read_to_end(&mut buf).expect("read failed");
-
-                        // TODO unclear how completely we need to specify types
-                        // for OrdValBatch here
-                        let batch = if let Some((batch, remaining)) =
-                            unsafe { decode::<OrdValBatch<i32, i32, i32, isize>>(&mut buf) }
-                        {
-                            assert!(remaining.len() == 0);
-                            //println!("decoded: {:?}", batch);
-                            batch
-                        } else {
-                            // TODO In the future we'll need to be able to handle this
-                            // more gracefully
-                            panic!("unable to decode batch");
-                        };
-
-                        // Step through all the (key, val, time, diff) tuples in this batch
-                        // and send them to our computation
-                        let mut cursor = batch.cursor();
-                        cursor.rewind_keys(&batch);
-                        cursor.rewind_vals(&batch);
-
-                        while cursor.key_valid(&batch) {
-                            let key = cursor.key(&batch).clone();
-                            while cursor.val_valid(&batch) {
-                                let val = cursor.val(&batch).clone();
-                                cursor.map_times(&batch, |_ts, r| {
-                                    output.session(&cap).give((key, val, r.clone()));
-                                });
-                                cursor.step_val(&batch);
-                            }
-                            cursor.step_key(&batch);
-                        }
-
-                        // downgrade capability.
-                        cap.downgrade(&10);
-                        done = true;
-                    }
-
-                    if done {
-                        cap = None;
-                    } else {
-                        activator.activate();
-                    }
-                }
-            })
-            .as_collection()
-            .inspect(|x| println!("rereading {:?}", x));
+            //.arrange();
 
             // return the handle so other non-dataflow code can feed us data
             handle
@@ -135,12 +140,13 @@ fn main() {
         for person in 0..size {
             input.insert((person / 2, person));
         }
-
-        for person in 1..size {
-            input.advance_to(person);
-            input.remove((person / 2, person));
-            input.insert((person / 3, person));
-        }
+        /*
+                for person in 1..size {
+                    input.advance_to(person);
+                    input.remove((person / 2, person));
+                    input.insert((person / 3, person));
+                }
+        */
     })
     .expect("Computation terminated abnormally");
 }
