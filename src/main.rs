@@ -3,6 +3,7 @@ use std::io::{Read, Write};
 use abomonation::{decode, encode};
 use differential_dataflow::input::Input;
 use differential_dataflow::operators::arrange::{ArrangeByKey, ArrangeBySelf};
+use differential_dataflow::operators::consolidate::Consolidate;
 use differential_dataflow::operators::JoinCore;
 use differential_dataflow::trace::implementations::ord::OrdValBatch;
 use differential_dataflow::trace::{BatchReader, Cursor};
@@ -31,66 +32,75 @@ fn main() {
             source::<_, _, _, _>(scope, "BatchReader", |mut capability, info| {
                 let activator = scope.activator_for(&info.address[..]);
 
+                let mut cap = Some(capability);
                 move |output| {
-                    let mut time = capability.time().clone();
-                    {
-                        // get some data and send it.
-                        let mut file =
-                            std::fs::File::open("testing").expect("open stored batch file");
-                        let mut buf: Vec<u8> = Vec::new();
-                        file.read_to_end(&mut buf).expect("read failed");
-
-                        // TODO unclear how completely we need to specify types
-                        // for OrdValBatch here
-                        let batch = if let Some((batch, remaining)) =
-                            unsafe { decode::<OrdValBatch<i32, i32, i32, isize>>(&mut buf) }
+                    if let Some(cap) = cap.as_mut() {
+                        let mut time = cap.time().clone();
                         {
-                            assert!(remaining.len() == 0);
-                            //println!("decoded: {:?}", batch);
-                            batch
-                        } else {
-                            // TODO In the future we'll need to be able to handle this
-                            // more gracefully
-                            panic!("unable to decode batch");
-                        };
+                            // get some data and send it.
+                            let mut file =
+                                std::fs::File::open("testing-3").expect("open stored batch file");
+                            let mut buf: Vec<u8> = Vec::new();
+                            file.read_to_end(&mut buf).expect("read failed");
 
-                        let mut session = output.session(&capability);
-                        // Step through all the (key, val, time, diff) tuples in this batch
-                        // and send them to our computation
-                        let mut cursor = batch.cursor();
-                        cursor.rewind_keys(&batch);
-                        cursor.rewind_vals(&batch);
+                            // TODO unclear how completely we need to specify types
+                            // for OrdValBatch here
+                            let batch = if let Some((batch, remaining)) =
+                                unsafe { decode::<OrdValBatch<i32, i32, i32, isize>>(&mut buf) }
+                            {
+                                assert!(remaining.len() == 0);
+                                //println!("decoded: {:?}", batch);
+                                batch
+                            } else {
+                                // TODO In the future we'll need to be able to handle this
+                                // more gracefully
+                                panic!("unable to decode batch");
+                            };
 
-                        while cursor.key_valid(&batch) {
-                            while cursor.val_valid(&batch) {
-                                cursor.map_times(&batch, |ts, r| {
-                                    session.give((
-                                        (cursor.key(&batch).clone(), cursor.val(&batch).clone()),
-                                        ts.clone(),
-                                        r.clone(),
-                                    ));
-                                });
-                                cursor.step_val(&batch);
+                            let mut session = output.session(&cap);
+                            // Step through all the (key, val, time, diff) tuples in this batch
+                            // and send them to our computation
+                            let mut cursor = batch.cursor();
+                            cursor.rewind_keys(&batch);
+                            cursor.rewind_vals(&batch);
+
+                            while cursor.key_valid(&batch) {
+                                let key = cursor.key(&batch);
+                                while cursor.val_valid(&batch) {
+                                    let val = cursor.val(&batch);
+                                    cursor.map_times(&batch, |ts, r| {
+                                        session.give((
+                                            (key.clone(), val.clone()),
+                                            ts.clone(),
+                                            r.clone(),
+                                        ));
+                                    });
+                                    cursor.step_val(&batch);
+                                }
+                                cursor.step_key(&batch);
                             }
-                            cursor.step_key(&batch);
                         }
+                        cap.downgrade(&time);
                     }
                     // downgrade capability.
-                    capability.downgrade(&time);
                     activator.activate();
+                    cap = None;
                 }
             })
             .probe_with(&mut probe)
-            //.inspect(|x| println!("rereading {:?}", x))
             .as_collection()
+            .consolidate()
+            .inspect(|x| println!("rereading {:?}", x))
             .arrange_by_key()
-            //.trace
+            .trace
         });
 
         // define a new computation.
         let mut input = worker.dataflow(|scope| {
             let (handle, manages) = scope.new_collection();
             manages.inspect(|x| println!("manages: {:?}", x));
+            let old = old_batch.import(scope);
+            //old.as_collection(|x,y| (x.clone(), y.clone())).inspect(|x| println!("old: {:?}", x));
             let reverse = manages.map(|(manager, employee)| (employee, manager));
 
             // Let's store and bring back these collections because we have a good idea
@@ -100,8 +110,8 @@ fn main() {
 
             // if (m2, m1) and (m1, p), then output (m1, (m2, p))
             manages
-                .join_core(&reverse, |m2, m1, p| Some((*m2, *m1, *p)))
-                .inspect(|x| println!("manages: {:?}", x));
+                .join_core(&old, |m2, m1, p| Some((*m2, *m1, *p)))
+                .inspect(|x| println!("join: {:?}", x));
 
             // We'll use a sink to write down the stream of batches we
             // get from the manages collection
@@ -116,7 +126,7 @@ fn main() {
                         //println!("{:?}", bytes);
 
                         // TODO in a more realistic scenario we would give this file a new name every time
-                        let mut file = std::fs::File::create("testing-2")
+                        let mut file = std::fs::File::create("testing-end")
                             .expect("creating file to write batches");
                         file.write(&bytes).expect("writing batches should succeed");
                         file.flush().expect("flushing batches should succeed");
@@ -133,20 +143,26 @@ fn main() {
         });
 
         // Read a size for our organization from the arguments.
-        let size = std::env::args().nth(1).unwrap().parse().unwrap();
+        let size: i32 = std::env::args().nth(1).unwrap().parse().unwrap();
 
         // Load input (a binary tree).
         input.advance_to(0);
-        for person in 0..size {
-            input.insert((person / 2, person));
-        }
         /*
-                for person in 1..size {
-                    input.advance_to(person);
-                    input.remove((person / 2, person));
-                    input.insert((person / 3, person));
-                }
+         for person in 0..size {
+             input.insert((person / 2, person));
+         }
+
+                 for person in 1..size {
+                     input.advance_to(person);
+                     input.remove((person / 2, person));
+                     input.insert((person / 3, person));
+                 }
         */
+
+        input.advance_to(10);
+        input.insert((4, 8));
+        input.insert((4, 9));
+        input.insert((3, 9));
     })
     .expect("Computation terminated abnormally");
 }
