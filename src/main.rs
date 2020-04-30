@@ -13,6 +13,7 @@ use timely::dataflow::operators::generic::operator::Operator;
 use timely::dataflow::operators::generic::source;
 use timely::dataflow::operators::probe::{Handle, Probe};
 use timely::dataflow::operators::{Capability, Inspect};
+use timely::order::PartialOrder;
 use timely::scheduling::Scheduler;
 
 //
@@ -69,9 +70,23 @@ fn main() {
                                 while cursor.val_valid(&batch) {
                                     let val = cursor.val(&batch);
                                     cursor.map_times(&batch, |ts, r| {
+                                        if time.less_than(ts) {
+                                            time = *ts;
+                                        }
                                         session.give((
                                             (key.clone(), val.clone()),
-                                            ts.clone(),
+                                            // XXX this is a total hack
+                                            // but the intuition is - if updates can be brought
+                                            // forward to a time on the frontier
+                                            // why can't they go backwards? (before any execution)
+                                            // Make it so that all updates from saved state present as happening
+                                            // at Timestamp::minimum() TODO actually use that API
+                                            // The goal is to let us use a saved arrangement without having
+                                            // to coordinate with other dataflows about which timestamp to go
+                                            // forwards to
+                                            // I think we may be able to achieve a similar transform via going forwards
+                                            // in time with delay
+                                            0,
                                             r.clone(),
                                         ));
                                     });
@@ -89,7 +104,7 @@ fn main() {
             })
             .probe_with(&mut probe)
             .as_collection()
-            .consolidate()
+            //.consolidate()
             .inspect(|x| println!("rereading {:?}", x))
             .arrange_by_key()
             .trace
@@ -100,7 +115,6 @@ fn main() {
             let (handle, manages) = scope.new_collection();
             manages.inspect(|x| println!("manages: {:?}", x));
             let old = old_batch.import(scope);
-            //old.as_collection(|x,y| (x.clone(), y.clone())).inspect(|x| println!("old: {:?}", x));
             let reverse = manages.map(|(manager, employee)| (employee, manager));
 
             // Let's store and bring back these collections because we have a good idea
@@ -122,8 +136,8 @@ fn main() {
                         unsafe {
                             encode(&(**d), &mut bytes).expect("encoding batches failed");
                         }
-                        //println!("{:?}", d);
-                        //println!("{:?}", bytes);
+                        println!("{:?}", d);
+                        println!("{:?}", bytes);
 
                         // TODO in a more realistic scenario we would give this file a new name every time
                         let mut file = std::fs::File::create("testing-end")
@@ -134,10 +148,6 @@ fn main() {
                 }
             });
 
-            // We'll use a source to read in a previously saved version of the
-            // manages collection if it exists
-            //.arrange();
-
             // return the handle so other non-dataflow code can feed us data
             handle
         });
@@ -147,22 +157,16 @@ fn main() {
 
         // Load input (a binary tree).
         input.advance_to(0);
-        /*
-         for person in 0..size {
-             input.insert((person / 2, person));
-         }
 
-                 for person in 1..size {
-                     input.advance_to(person);
-                     input.remove((person / 2, person));
-                     input.insert((person / 3, person));
-                 }
-        */
+        for person in 0..size {
+            input.insert((person / 2, person));
+        }
 
-        input.advance_to(10);
-        input.insert((4, 8));
-        input.insert((4, 9));
-        input.insert((3, 9));
+        for person in 1..size {
+            input.advance_to(person);
+            input.remove((person / 2, person));
+            input.insert((person / 3, person));
+        }
     })
     .expect("Computation terminated abnormally");
 }
