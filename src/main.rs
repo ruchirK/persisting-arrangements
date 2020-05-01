@@ -113,8 +113,11 @@ fn main() {
         // define a new computation.
         let mut input = worker.dataflow(|scope| {
             let (handle, manages) = scope.new_collection();
-            manages.inspect(|x| println!("manages: {:?}", x));
-            let old = old_batch.import(scope);
+            // Converting my imported trace back to a collection because I want to
+            // concat it back into the original, and I don't have a concat-like
+            // operator over arrangements
+            let old = old_batch.import(scope).as_collection(|k, v| (*k, *v));
+            let manages = manages.concat(&old).inspect(|x| println!("manages: {:?}", x));
             let reverse = manages.map(|(manager, employee)| (employee, manager));
 
             // Let's store and bring back these collections because we have a good idea
@@ -124,13 +127,13 @@ fn main() {
 
             // if (m2, m1) and (m1, p), then output (m1, (m2, p))
             manages
-                .join_core(&old, |m2, m1, p| Some((*m2, *m1, *p)))
+                .join_core(&reverse, |m2, m1, p| Some((*m2, *m1, *p)))
                 .inspect(|x| println!("join: {:?}", x));
 
             // We'll use a sink to write down the stream of batches we
             // get from the manages collection
             manages.stream.sink(Pipeline, "BatchWriter", |input| {
-                while let Some((_time, data)) = input.next() {
+                while let Some((time, data)) = input.next() {
                     for d in data.iter() {
                         let mut bytes = Vec::new();
                         unsafe {
