@@ -29,7 +29,13 @@ fn main() {
     timely::execute_from_args(std::env::args(), move |worker| {
         let mut probe = timely::dataflow::operators::probe::Handle::new();
 
-        let mut old_batch = worker.dataflow::<i32, _, _>(|scope| {
+        // In this dataflow we are reading a previously saved set of batches from
+        // disk, rearranging it and setting everything to start before any updates we will receive
+        // and sending it to be shared to other dataflow computations
+        // Input: Vec<Path> or something like that to know which files to read
+        // Output: An arrangement containing all of the data in those stored batches, consolidated to
+        // an artificially early timestamp
+        let mut old_batch = worker.dataflow::<u32, _, _>(|scope| {
             source::<_, _, _, _>(scope, "BatchReader", |mut capability, info| {
                 let activator = scope.activator_for(&info.address[..]);
 
@@ -70,8 +76,8 @@ fn main() {
                                 while cursor.val_valid(&batch) {
                                     let val = cursor.val(&batch);
                                     cursor.map_times(&batch, |ts, r| {
-                                        if time.less_than(ts) {
-                                            time = *ts;
+                                        if time.less_than(&(*ts as u32)) {
+                                            time = *ts as u32;
                                         }
                                         session.give((
                                             (key.clone(), val.clone()),
@@ -110,14 +116,56 @@ fn main() {
             .trace
         });
 
-        // define a new computation.
-        let mut input = worker.dataflow(|scope| {
-            let (handle, manages) = scope.new_collection();
+        // TODO: we need some mechanism to wait while saved state is loading
+
+        // Let's use the saved state in a new computation and advance further
+        // We will approximate "reading from kafka" via an infinite loop that
+        // generates some inserts and deletes. Maybe initially to keep it simple
+        // we just generate inserts?
+        // Inputs:
+        // - starting point: some i32 x to tell us where to begin
+        // - old batch data
+        // - a place to write batches down to
+        let starting_point = 0;
+        worker.dataflow::<u32, _, _>(|scope| {
+            let manages = source(scope, "DataInput", |mut capability, info| {
+                let activator = scope.activator_for(&info.address[..]);
+
+                let mut cap = Some(capability);
+                move |output| {
+                    if let Some(cap) = cap.as_mut() {
+                        let mut time = cap.time().clone();
+                        {
+                            // generate data here
+                            for p in starting_point..201 {
+                                {
+                                    let mut session = output.session(&cap);
+                                    session.give(((p / 2, p), time, 1));
+                                }
+
+                                if p % 100 == 0 {
+                                    cap.downgrade(&time);
+                                    activator.activate();
+                                    time += 11;
+                                }
+                            }
+                        }
+                    }
+                    cap = None;
+                }
+            })
+            //.probe_with(&mut input_probe)
+            .as_collection();
+            //.inspect(|x| println!("stream {:?}", x));
+
+            //let (handle, manages) = scope.new_collection();
             // Converting my imported trace back to a collection because I want to
             // concat it back into the original, and I don't have a concat-like
             // operator over arrangements
             let old = old_batch.import(scope).as_collection(|k, v| (*k, *v));
-            let manages = manages.concat(&old).inspect(|x| println!("manages: {:?}", x));
+            let manages = manages
+                .concat(&old)
+                .inspect(|x| println!("concat old + manages {:?}", x));
             let reverse = manages.map(|(manager, employee)| (employee, manager));
 
             // Let's store and bring back these collections because we have a good idea
@@ -126,9 +174,8 @@ fn main() {
             let reverse = reverse.arrange_by_key();
 
             // if (m2, m1) and (m1, p), then output (m1, (m2, p))
-            manages
-                .join_core(&reverse, |m2, m1, p| Some((*m2, *m1, *p)))
-                .inspect(|x| println!("join: {:?}", x));
+            manages.join_core(&reverse, |m2, m1, p| Some((*m2, *m1, *p)));
+            //.inspect(|x| println!("join: {:?}", x));
 
             // We'll use a sink to write down the stream of batches we
             // get from the manages collection
@@ -139,8 +186,8 @@ fn main() {
                         unsafe {
                             encode(&(**d), &mut bytes).expect("encoding batches failed");
                         }
-                        println!("{:?}", d);
-                        println!("{:?}", bytes);
+                        println!("{:?}", d.description());
+                        //println!("{:?}", bytes);
 
                         // TODO in a more realistic scenario we would give this file a new name every time
                         let mut file = std::fs::File::create("testing-end")
@@ -152,24 +199,29 @@ fn main() {
             });
 
             // return the handle so other non-dataflow code can feed us data
-            handle
+            //handle
         });
 
         // Read a size for our organization from the arguments.
-        let size: i32 = std::env::args().nth(1).unwrap().parse().unwrap();
+        //let size: i32 = std::env::args().nth(1).unwrap().parse().unwrap();
+        /*
+                // Load input (a binary tree).
+                input.advance_to(0);
 
-        // Load input (a binary tree).
-        input.advance_to(0);
+                for person in 0..size {
+                    input.insert((person / 2, person));
+                }
 
-        for person in 0..size {
-            input.insert((person / 2, person));
-        }
+                input.flush();
 
-        for person in 1..size {
-            input.advance_to(person);
-            input.remove((person / 2, person));
-            input.insert((person / 3, person));
-        }
+                for person in 1..size {
+                    input.advance_to(person);
+                    input.remove((person / 2, person));
+                    input.insert((person / 3, person));
+                }
+
+                input.flush();
+        */
     })
     .expect("Computation terminated abnormally");
 }
