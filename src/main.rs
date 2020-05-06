@@ -108,7 +108,7 @@ fn main() {
                     cap = None;
                 }
             })
-            .probe_with(&mut probe)
+            //.probe_with(&mut probe)
             .as_collection()
             //.consolidate()
             .inspect(|x| println!("rereading {:?}", x))
@@ -130,28 +130,39 @@ fn main() {
         worker.dataflow::<u32, _, _>(|scope| {
             let manages = source(scope, "DataInput", |mut capability, info| {
                 let activator = scope.activator_for(&info.address[..]);
+                let handle = probe.clone();
 
                 let mut cap = Some(capability);
+                let mut x: i32 = 0;
                 move |output| {
+                    let mut done = false;
+
                     if let Some(cap) = cap.as_mut() {
+                        /* TODO figure out what was wrong with this probe
+                           if handle.less_than(cap.time()) {
+                            return;
+                        }*/
                         let mut time = cap.time().clone();
                         {
-                            // generate data here
-                            for p in starting_point..201 {
-                                {
-                                    let mut session = output.session(&cap);
-                                    session.give(((p / 2, p), time, 1));
-                                }
-
-                                if p % 100 == 0 {
-                                    cap.downgrade(&time);
-                                    activator.activate();
-                                    time += 11;
-                                }
-                            }
+                            let mut session = output.session(&cap);
+                            session.give(((x / 2, x), time, 1));
+                            session.give(((x / 2, x), time, -1));
+                            session.give(((x / 3, x), time, 1));
                         }
+
+                        if x % 100 == 0 {
+                            cap.downgrade(&(time + 1));
+                        }
+                        x += 1;
+
+                        done = x > 1000;
                     }
-                    cap = None;
+
+                    if done {
+                        cap = None;
+                    } else {
+                        activator.activate()
+                    }
                 }
             })
             //.probe_with(&mut input_probe)
@@ -163,9 +174,9 @@ fn main() {
             // concat it back into the original, and I don't have a concat-like
             // operator over arrangements
             let old = old_batch.import(scope).as_collection(|k, v| (*k, *v));
-            let manages = manages
-                .concat(&old)
-                .inspect(|x| println!("concat old + manages {:?}", x));
+            let manages = manages.concat(&old);
+            //.probe_with(&mut probe)
+            //.inspect(|x| println!("concat old + manages {:?}", x));
             let reverse = manages.map(|(manager, employee)| (employee, manager));
 
             // Let's store and bring back these collections because we have a good idea
@@ -174,7 +185,9 @@ fn main() {
             let reverse = reverse.arrange_by_key();
 
             // if (m2, m1) and (m1, p), then output (m1, (m2, p))
-            manages.join_core(&reverse, |m2, m1, p| Some((*m2, *m1, *p)));
+            manages
+                .join_core(&reverse, |m2, m1, p| Some((*m2, *m1, *p)))
+                .probe_with(&mut probe);
             //.inspect(|x| println!("join: {:?}", x));
 
             // We'll use a sink to write down the stream of batches we
@@ -202,6 +215,7 @@ fn main() {
             //handle
         });
 
+        drop(old_batch);
         // Read a size for our organization from the arguments.
         //let size: i32 = std::env::args().nth(1).unwrap().parse().unwrap();
         /*
