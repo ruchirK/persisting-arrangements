@@ -1,10 +1,12 @@
+use std::collections::BTreeSet;
 use std::io::{Read, Write};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use abomonation::{decode, encode};
 use differential_dataflow::input::Input;
 use differential_dataflow::operators::arrange::{ArrangeByKey, ArrangeBySelf};
 use differential_dataflow::operators::consolidate::Consolidate;
-use differential_dataflow::operators::JoinCore;
+use differential_dataflow::operators::{Count, JoinCore};
 use differential_dataflow::trace::implementations::ord::OrdValBatch;
 use differential_dataflow::trace::{BatchReader, Cursor};
 use differential_dataflow::AsCollection;
@@ -18,17 +20,61 @@ use timely::scheduling::Scheduler;
 
 //
 // Open questions
-// 1. Why does the batch have an upper of []?
-// 2. How to write down the batch in a sink in a format we can read back in?
-// 3. How do we read the batch data back in
-//  a. it seems like at least in this toy we could interleave a timely source with some control flow
-//  but its a scattered thought
+// 1. Why does the final batch have an upper of []?
 
 fn main() {
     // define a new timely dataflow computation.
     timely::execute_from_args(std::env::args(), move |worker| {
         let mut probe = timely::dataflow::operators::probe::Handle::new();
 
+        let file_prefix = "testing";
+        let paths = std::fs::read_dir("./").unwrap();
+        let mut recovery_ts: u64 = 0;
+        let mut recovery_offset = 0;
+        let mut delta = 10000;
+        let mut files_to_read = BTreeSet::new();
+
+        // We'll use normal dataflow to figure out which files we can recover from and
+        // which offset to start reading from
+        for path in paths {
+            let filename = path
+                .unwrap()
+                .path()
+                .file_name()
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .to_owned();
+
+            if filename.starts_with(file_prefix) {
+                let parts: Vec<_> = filename.split('-').collect();
+
+                if parts.len() == 3 {
+                    let ts = parts[1].parse::<u64>().unwrap();
+                    let offset = parts[2].parse::<u64>().unwrap();
+
+                    // We found a more recent recovery file, lets use it instead
+                    if ts > recovery_ts {
+                        recovery_ts = ts;
+                        recovery_offset = 0;
+                        files_to_read.clear();
+                    }
+
+                    if ts == recovery_ts {
+                        files_to_read.insert(filename);
+                        if offset > recovery_offset {
+                            recovery_offset = offset;
+                        }
+                    }
+                }
+            }
+        }
+
+        println!(
+            "reading from offset: {}, will read to: {}",
+            recovery_offset,
+            recovery_offset + delta
+        );
         // In this dataflow we are reading a previously saved set of batches from
         // disk, rearranging it and setting everything to start before any updates we will receive
         // and sending it to be shared to other dataflow computations
@@ -43,10 +89,10 @@ fn main() {
                 move |output| {
                     if let Some(cap) = cap.as_mut() {
                         let mut time = cap.time().clone();
-                        {
+                        for f in files_to_read.iter() {
                             // get some data and send it.
-                            let mut file =
-                                std::fs::File::open("testing-3").expect("open stored batch file");
+                            println!("opening {} to load up a stored batch", f);
+                            let mut file = std::fs::File::open(f).expect("open stored batch file");
                             let mut buf: Vec<u8> = Vec::new();
                             file.read_to_end(&mut buf).expect("read failed");
 
@@ -111,12 +157,10 @@ fn main() {
             //.probe_with(&mut probe)
             .as_collection()
             //.consolidate()
-            .inspect(|x| println!("rereading {:?}", x))
+            //.inspect(|x| println!("rereading {:?}", x))
             .arrange_by_key()
             .trace
         });
-
-        // TODO: we need some mechanism to wait while saved state is loading
 
         // Let's use the saved state in a new computation and advance further
         // We will approximate "reading from kafka" via an infinite loop that
@@ -126,22 +170,17 @@ fn main() {
         // - starting point: some i32 x to tell us where to begin
         // - old batch data
         // - a place to write batches down to
-        let starting_point = 0;
         worker.dataflow::<u32, _, _>(|scope| {
             let manages = source(scope, "DataInput", |mut capability, info| {
                 let activator = scope.activator_for(&info.address[..]);
                 let handle = probe.clone();
 
                 let mut cap = Some(capability);
-                let mut x: i32 = 0;
+                let mut x: i32 = (recovery_offset + 1) as i32;
                 move |output| {
                     let mut done = false;
 
                     if let Some(cap) = cap.as_mut() {
-                        /* TODO figure out what was wrong with this probe
-                           if handle.less_than(cap.time()) {
-                            return;
-                        }*/
                         let mut time = cap.time().clone();
                         {
                             let mut session = output.session(&cap);
@@ -155,7 +194,7 @@ fn main() {
                         }
                         x += 1;
 
-                        done = x > 1000;
+                        done = x > (recovery_offset + delta + 1) as i32;
                     }
 
                     if done {
@@ -169,12 +208,18 @@ fn main() {
             .as_collection();
             //.inspect(|x| println!("stream {:?}", x));
 
-            //let (handle, manages) = scope.new_collection();
             // Converting my imported trace back to a collection because I want to
             // concat it back into the original, and I don't have a concat-like
             // operator over arrangements
             let old = old_batch.import(scope).as_collection(|k, v| (*k, *v));
-            let manages = manages.concat(&old);
+            let manages = manages.concat(&old).consolidate();
+
+            // We'll use this dataflow to check if we got a duplicate record
+            manages
+                .map(|(k, v)| ((k, v), ()))
+                .count()
+                .filter(|(_, count)| *count != 1)
+                .inspect(|x| println!("error: got count that wasn't one: {:?}", x));
             //.probe_with(&mut probe)
             //.inspect(|x| println!("concat old + manages {:?}", x));
             let reverse = manages.map(|(manager, employee)| (employee, manager));
@@ -188,54 +233,54 @@ fn main() {
             manages
                 .join_core(&reverse, |m2, m1, p| Some((*m2, *m1, *p)))
                 .probe_with(&mut probe);
-            //.inspect(|x| println!("join: {:?}", x));
 
             // We'll use a sink to write down the stream of batches we
             // get from the manages collection
-            manages.stream.sink(Pipeline, "BatchWriter", |input| {
+            // Lets figure out a timestamp to identify these files with
+            let startup_time = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("just tell me what time it is")
+                .as_secs();
+            manages.stream.sink(Pipeline, "BatchWriter", move |input| {
                 while let Some((time, data)) = input.next() {
                     for d in data.iter() {
+                        // Need to figure out the offset. We will cheat and do so by looking at all of the records in this batch
+                        // to find the one with the largest v (given (k, v))
+                        let mut offset = 0;
+
+                        let mut cursor = d.cursor();
+                        cursor.rewind_keys(&d);
+                        cursor.rewind_vals(&d);
+
+                        while cursor.key_valid(&d) {
+                            while cursor.val_valid(&d) {
+                                let val = cursor.val(d);
+                                if *val > offset {
+                                    offset = *val;
+                                }
+                                cursor.step_val(&d);
+                            }
+                            cursor.step_key(&d);
+                        }
+
                         let mut bytes = Vec::new();
                         unsafe {
                             encode(&(**d), &mut bytes).expect("encoding batches failed");
                         }
-                        println!("{:?}", d.description());
+                        println!("{:?} {:?}", d.description(), time);
                         //println!("{:?}", bytes);
 
-                        // TODO in a more realistic scenario we would give this file a new name every time
-                        let mut file = std::fs::File::create("testing-end")
+                        let filename = format!("testing-{}-{}", startup_time, offset);
+                        let mut file = std::fs::File::create(filename)
                             .expect("creating file to write batches");
                         file.write(&bytes).expect("writing batches should succeed");
                         file.flush().expect("flushing batches should succeed");
                     }
                 }
             });
-
-            // return the handle so other non-dataflow code can feed us data
-            //handle
         });
 
         drop(old_batch);
-        // Read a size for our organization from the arguments.
-        //let size: i32 = std::env::args().nth(1).unwrap().parse().unwrap();
-        /*
-                // Load input (a binary tree).
-                input.advance_to(0);
-
-                for person in 0..size {
-                    input.insert((person / 2, person));
-                }
-
-                input.flush();
-
-                for person in 1..size {
-                    input.advance_to(person);
-                    input.remove((person / 2, person));
-                    input.insert((person / 3, person));
-                }
-
-                input.flush();
-        */
     })
     .expect("Computation terminated abnormally");
 }
